@@ -334,16 +334,12 @@ async def process_video(
         ratio = (1 - new_size / original_size) * 100 if original_size else 0
 
         await status_msg.edit_text(
-            f"⬆️ Загружаю сжатое видео…\n"
-            f"{_human_size(original_size)} → {_human_size(new_size)} "
-            f"(на {ratio:.0f}% меньше)"
+            f"⬆️ Загружаю сжатое видео… {_human_size(original_size)} > {_human_size(new_size)} (на {ratio:.0f}% меньше)"
         )
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
         caption = (
-            f"📦 Сжато\n"
-            f"{_human_size(original_size)} → {_human_size(new_size)} "
-            f"({ratio:.0f}% меньше)"
+            f"📦 Сжато {_human_size(original_size)} > {_human_size(new_size)} (на {ratio:.0f}% меньше)"
         )
 
         with output_path.open("rb") as f:
@@ -360,7 +356,7 @@ async def process_video(
             await status_msg.edit_text("✅ Готово.")
 
         logger.info(
-            "Compressed video in chat %s: %s → %s (%.1f%%)",
+            "Compressed video in chat %s: %s > %s (%.1f%%)",
             chat_id, _human_size(original_size), _human_size(new_size), ratio,
         )
 
@@ -408,7 +404,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help — Это сообщение\n\n"
         "⚠️ Если бот не видит обычные сообщения — отключите Privacy Mode "
         "в @BotFather (`/setprivacy` → Disable). "
-        "В этом случае можно пользоваться командой /compress."
+        "Альтернативно можно пользоваться командой /compress."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -431,8 +427,8 @@ async def add_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_monitored()
     title = chat.title or chat.full_name or str(chat_id)
     await update.message.reply_text(
-        f"✅ Добавлен *{title}* (`{chat_id}`) в отслеживаемые.\n"
-        f"Я буду сжимать новые видео, которые появятся здесь.",
+        f"✅ Чат *{title}* добавлен в отслеживаемые.\n"
+        f"Я буду автоматически сжимать все новые видео!",
         parse_mode=ParseMode.MARKDOWN,
     )
     logger.info("Added chat %s (%s)", chat_id, title)
