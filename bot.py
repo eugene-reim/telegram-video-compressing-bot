@@ -205,6 +205,8 @@ def _extract_video_info(message: Message) -> Optional[Tuple[str, int, str, int]]
     Extract (file_id, duration, file_name, file_size) from a message.
     Returns None if the message has no video.
     """
+    if message.animation:
+        return None
     if message.video:
         v = message.video
         return (
@@ -217,11 +219,13 @@ def _extract_video_info(message: Message) -> Optional[Tuple[str, int, str, int]]
         message.document
         and message.document.mime_type
         and message.document.mime_type.startswith("video/")
+        and not (message.document.file_name or "").lower().endswith(".gif")
+        and message.document.mime_type != "image/gif"
     ):
         d = message.document
         return (
             d.file_id,
-            0,  # will probe later
+            0,
             d.file_name or "video.mp4",
             d.file_size or 0,
         )
@@ -332,7 +336,7 @@ async def process_video(
         await status_msg.edit_text(
             f"⬆️ Загружаю сжатое видео…\n"
             f"{_human_size(original_size)} → {_human_size(new_size)} "
-            f"({ratio:.0f}% меньше)"
+            f"(на {ratio:.0f}% меньше)"
         )
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
