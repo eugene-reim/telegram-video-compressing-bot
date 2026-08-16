@@ -50,6 +50,7 @@ CRF = int(os.getenv("CRF", "28"))
 MAX_HEIGHT = int(os.getenv("MAX_HEIGHT", "720"))
 AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 PRESET = os.getenv("PRESET", "medium")
+DEFAULT_FPS = int(os.getenv("DEFAULT_FPS", "30"))
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 TMP_DIR = Path(os.getenv("TMP_DIR", "/app/tmp"))
@@ -129,8 +130,12 @@ def compress_video(
     input_path: Path,
     output_path: Path,
     progress_callback=None,
+    fps: int = 0,
 ) -> bool:
-    vf = f"scale=-2:'min({MAX_HEIGHT},ih)'"
+    filters = [f"scale=-2:'min({MAX_HEIGHT},ih)'"]
+    if fps > 0:
+        filters.append(f"fps={fps}")
+    vf = ",".join(filters)
 
     cmd = [
         "ffmpeg",
@@ -257,6 +262,7 @@ async def process_video(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     reply_to: Optional[Message] = None,
+    fps: int = 0,
 ) -> None:
     """
     Download → compress → upload pipeline.
@@ -348,6 +354,7 @@ async def process_video(
             input_path,
             output_path,
             progress_cb,
+            fps,
         )
 
         if not success or not output_path.exists():
@@ -525,6 +532,46 @@ async def compress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await process_video(replied, context, reply_to=message)
 
 
+async def compress_fps_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Ручное сжатие с понижением FPS.
+    Использование: ответить /compress_fps на видео
+    Можно указать FPS: /compress_fps 24
+    """
+    message = update.message
+    if not message:
+        return
+
+    replied = message.reply_to_message
+    if not replied:
+        await message.reply_text(
+            "Ответьте командой /compress_fps на сообщение с видео.\n"
+            "Можно указать FPS: /compress_fps 24"
+        )
+        return
+
+    # if replied.from_user and replied.from_user.is_bot:
+    #     await message.reply_text("Не могу сжимать сообщения ботов.")
+    #     return
+
+    if not _extract_video_info(replied):
+        await message.reply_text("В сообщении, на которое вы ответили, нет видео.")
+        return
+
+    # FPS из аргумента или значение по умолчанию
+    fps = DEFAULT_FPS
+    if context.args:
+        try:
+            fps = int(context.args[0])
+            if fps < 1 or fps > 60:
+                raise ValueError
+        except ValueError:
+            await message.reply_text("FPS должен быть числом от 1 до 60.")
+            return
+
+    await process_video(replied, context, reply_to=message, fps=fps)
+
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Автоматическая обработка видео в отслеживаемых чатах."""
     message = update.message
@@ -566,6 +613,7 @@ def main() -> None:
     application.add_handler(CommandHandler("remove", remove_chat))
     application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CommandHandler("compress", compress_cmd))
+    application.add_handler(CommandHandler("compress_fps", compress_fps_cmd))
 
     application.add_handler(
         MessageHandler(
