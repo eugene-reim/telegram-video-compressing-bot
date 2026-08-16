@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-Telegram Video Compressor Bot («Жмыхач»)
-
-Мониторит выбранные чаты, автоматически сжимает видео через ffmpeg
-и отвечает уменьшенной версией. Также поддерживает ручное сжатие
-командой /compress (ответом на сообщение с видео).
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -31,6 +23,17 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import TelegramError
+
+from telegram.request import HTTPXRequest
+
+request = HTTPXRequest(
+    connection_pool_size=8,
+    connect_timeout=30.0,
+    read_timeout=30.0,
+    write_timeout=60.0,
+    pool_timeout=30.0,
+)
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -68,6 +71,7 @@ monitored_chats: Set[int] = set()
 # Persistence
 # ---------------------------------------------------------------------------
 
+
 def load_monitored() -> None:
     global monitored_chats
     if MONITORED_FILE.exists():
@@ -96,14 +100,18 @@ def save_monitored() -> None:
 # ffmpeg helpers
 # ---------------------------------------------------------------------------
 
+
 def get_video_duration(path: Path) -> Optional[float]:
     try:
         result = subprocess.run(
             [
                 "ffprobe",
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
                 str(path),
             ],
             capture_output=True,
@@ -127,15 +135,24 @@ def compress_video(
     cmd = [
         "ffmpeg",
         "-y",
-        "-i", str(input_path),
-        "-c:v", "libx264",
-        "-crf", str(CRF),
-        "-preset", PRESET,
-        "-vf", vf,
-        "-c:a", "aac",
-        "-b:a", AUDIO_BITRATE,
-        "-movflags", "+faststart",
-        "-progress", "pipe:1",
+        "-i",
+        str(input_path),
+        "-c:v",
+        "libx264",
+        "-crf",
+        str(CRF),
+        "-preset",
+        PRESET,
+        "-vf",
+        vf,
+        "-c:a",
+        "aac",
+        "-b:a",
+        AUDIO_BITRATE,
+        "-movflags",
+        "+faststart",
+        "-progress",
+        "pipe:1",
         "-nostats",
         str(output_path),
     ]
@@ -184,7 +201,9 @@ def compress_video(
 
         if process.returncode != 0:
             stderr = process.stderr.read() if process.stderr else ""
-            logger.error("ffmpeg failed (code %s): %s", process.returncode, stderr[-2000:])
+            logger.error(
+                "ffmpeg failed (code %s): %s", process.returncode, stderr[-2000:]
+            )
             return False
 
         if progress_callback:
@@ -199,6 +218,7 @@ def compress_video(
 # ---------------------------------------------------------------------------
 # Shared video processing
 # ---------------------------------------------------------------------------
+
 
 def _extract_video_info(message: Message) -> Optional[Tuple[str, int, str, int]]:
     """
@@ -256,7 +276,9 @@ async def process_video(
     if duration and duration > MAX_DURATION_SECONDS:
         logger.info(
             "Skipping video in chat %s: duration %ss > limit %ss",
-            chat_id, duration, MAX_DURATION_SECONDS,
+            chat_id,
+            duration,
+            MAX_DURATION_SECONDS,
         )
         return
 
@@ -268,7 +290,9 @@ async def process_video(
             "⏳ Обработка видео — начинаю сжатие…\n"
             f"Оригинал: {_human_size(file_size)}"
         )
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+        await context.bot.send_chat_action(
+            chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO
+        )
 
         work_dir = Path(tempfile.mkdtemp(prefix="vcomp_", dir=str(TMP_DIR)))
         input_path = work_dir / "input"
@@ -336,11 +360,11 @@ async def process_video(
         await status_msg.edit_text(
             f"⬆️ Загружаю сжатое видео… {_human_size(original_size)} > {_human_size(new_size)} (на {ratio:.0f}% меньше)"
         )
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-
-        caption = (
-            f"📦 Сжато {_human_size(original_size)} > {_human_size(new_size)} (на {ratio:.0f}% меньше)"
+        await context.bot.send_chat_action(
+            chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO
         )
+
+        caption = f"📦 Сжато {_human_size(original_size)} > {_human_size(new_size)} (на {ratio:.0f}% меньше)"
 
         with output_path.open("rb") as f:
             await reply_to.reply_video(
@@ -357,7 +381,10 @@ async def process_video(
 
         logger.info(
             "Compressed video in chat %s: %s > %s (%.1f%%)",
-            chat_id, _human_size(original_size), _human_size(new_size), ratio,
+            chat_id,
+            _human_size(original_size),
+            _human_size(new_size),
+            ratio,
         )
 
     except Exception as e:
@@ -390,6 +417,7 @@ def _human_size(num: int | float) -> str:
 # ---------------------------------------------------------------------------
 # Bot handlers
 # ---------------------------------------------------------------------------
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
@@ -490,9 +518,7 @@ async def compress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if not _extract_video_info(replied):
-        await message.reply_text(
-            "В сообщении, на которое вы ответили, нет видео."
-        )
+        await message.reply_text("В сообщении, на которое вы ответили, нет видео.")
         return
 
     # Process the replied message; reply status/result to the /compress command
@@ -521,12 +547,15 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     load_monitored()
 
     application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .request(request)
+        .get_updates_request(request)
         .concurrent_updates(True)
         .build()
     )
@@ -547,7 +576,9 @@ def main() -> None:
 
     logger.info(
         "Bot starting… max_duration=%ss, max_height=%s, crf=%s",
-        MAX_DURATION_SECONDS, MAX_HEIGHT, CRF,
+        MAX_DURATION_SECONDS,
+        MAX_HEIGHT,
+        CRF,
     )
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
