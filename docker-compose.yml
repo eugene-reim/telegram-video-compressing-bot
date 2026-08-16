@@ -1,0 +1,24 @@
+services:
+  video-bot:
+    build: .
+    image: telegram-video-compressor:local
+    container_name: telegram-video-compressor
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - MAX_DURATION_SECONDS=${MAX_DURATION_SECONDS:-600}
+      - MAX_HEIGHT=${MAX_HEIGHT:-720}
+      - CRF=${CRF:-28}
+      - PRESET=${PRESET:-medium}
+      - AUDIO_BITRATE=${AUDIO_BITRATE:-128k}
+      - DATA_DIR=/app/data
+      - TMP_DIR=/app/tmp
+    volumes:
+      # Persist monitored chats list
+      - ./data:/app/data
+    # Resource limits (optional, uncomment if needed)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "2"
+    #       memory: 2G

@@ -1,0 +1,43 @@
+# Secrets – never commit
+.env
+.env.local
+.env.*.local
+
+# Runtime data
+data/
+tmp/
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.avi
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Docker (optional local overrides)
+docker-compose.override.yml

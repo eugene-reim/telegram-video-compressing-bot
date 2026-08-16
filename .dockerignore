@@ -1,0 +1,49 @@
+# Secrets & local config – never bake into image
+.env
+.env.*
+!.env.example
+
+# Runtime / generated data
+data/
+tmp/
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.avi
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Git & IDE
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Docs & misc that are not needed at runtime
+README.md
+*.md
+.dockerignore
+Dockerfile
+docker-compose*.yml
+.DS_Store
+Thumbs.db
