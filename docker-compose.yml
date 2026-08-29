@@ -11,6 +11,7 @@ services:
       - CRF=${CRF:-28}
       - PRESET=${PRESET:-medium}
       - AUDIO_BITRATE=${AUDIO_BITRATE:-128k}
+      - COMPRESS_CONCURRENCY=${COMPRESS_CONCURRENCY:-1}
       - DATA_DIR=/app/data
       - TMP_DIR=/app/tmp
     volumes:
