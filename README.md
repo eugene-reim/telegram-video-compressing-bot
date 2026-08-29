@@ -8,6 +8,7 @@ Dockerized Telegram-бот, который автоматически (или в
 - **Ручное сжатие** командой `/compress` (ответом на сообщение с видео) — работает даже при включённом Privacy Mode
 - Добавление / удаление чатов прямо из Telegram (`/add`, `/remove`)
 - Живой прогресс сжатия (проценты + ETA)
+- Очередь сжатия + rate limiter (чтобы не ловить flood control при альбомах)
 - Лимит максимальной длительности видео
 - Настраиваемое качество (разрешение, CRF, preset, битрейт аудио)
 - **Multi-stage Docker** + **uv**
@@ -65,6 +66,7 @@ docker compose logs -f
 | `CRF`                   | `28`         | Constant Rate Factor (18–28 — хороший баланс) |
 | `PRESET`                | `medium`     | Пресет ffmpeg (`ultrafast` … `slow`) |
 | `AUDIO_BITRATE`         | `128k`       | Битрейт AAC |
+| `COMPRESS_CONCURRENCY`  | `1`          | Сколько видео сжимать одновременно (1 — без flood) |
 
 ## GitHub: автосборка Docker-образа
 
