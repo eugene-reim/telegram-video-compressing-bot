@@ -278,8 +278,7 @@ async def process_video(
     if queued:
         try:
             status.attach(await reply_to.reply_text(
-                "⏳ Видео в очереди на сжатие…\n"
-                f"Оригинал: {_human_size(file_size)}"
+                "⏳ Видео в очереди на сжатие…"
             ))
         except TelegramError as e:
             logger.warning("Failed to send queue notice in chat %s: %s", chat_id, e)
@@ -287,8 +286,7 @@ async def process_video(
     async with compress_semaphore:
         try:
             start_text = (
-                "⏳ Обработка видео — начинаю сжатие…\n"
-                f"Оригинал: {_human_size(file_size)}"
+                "⏳ Обработка видео - начинаю сжатие…"
             )
             if status.msg is None:
                 status.attach(await reply_to.reply_text(start_text))
@@ -330,9 +328,7 @@ async def process_video(
                 last_edit = now
                 eta_str = f"~{int(eta)} с осталось" if eta and eta > 0 else "…"
                 text = (
-                    f"🔄 Сжимаю… *{percent:.0f}%*\n"
-                    f"{eta_str}\n"
-                    f"Оригинал: {_human_size(original_size)}"
+                    f"🔄 Сжимаю… *{percent:.0f}%* {eta_str}"
                 )
                 loop.call_soon_threadsafe(lambda t=text: status.set(t, progress=True))
 
@@ -354,7 +350,12 @@ async def process_video(
 
             new_size = output_path.stat().st_size
             ratio = (1 - new_size / original_size) * 100 if original_size else 0
-
+            
+            if ratio <=0:
+                await status.set_now("ℹ️ Сжатие не уменьшило размер файла.")
+                status.close()
+                return
+            
             await status.set_now(
                 f"⬆️ Загружаю сжатое видео… {_human_size(original_size)} > "
                 f"{_human_size(new_size)} (на {ratio:.0f}% меньше)"
