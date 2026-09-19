@@ -296,6 +296,90 @@ def compress_video(
         return False
 
 
+VOICE_MAX_BYTES = 50 * 1024 * 1024
+
+
+def has_audio_stream(path: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception as e:
+        logger.warning("ffprobe audio check failed: %s", e)
+        return False
+
+
+def _run_ffmpeg_with_progress(cmd: list[str], input_path: Path, output_path: Path, progress_callback=None) -> bool:
+    logger.info("Running ffmpeg: %s", " ".join(cmd))
+    try:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        duration = get_video_duration(input_path) or 0.0
+        last_percent = -1.0
+        start_time = time.time()
+        if process.stdout is None:
+            raise RuntimeError("ffmpeg stdout is unavailable")
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("out_time_ms="):
+                try:
+                    out_ms = int(line.split("=", 1)[1])
+                    if duration > 0:
+                        percent = min(99.0, (out_ms / 1_000_000) / duration * 100)
+                        if progress_callback and abs(percent - last_percent) >= 2.0:
+                            last_percent = percent
+                            eta = None
+                            if percent > 1:
+                                elapsed = time.time() - start_time
+                                eta = (elapsed / (percent / 100)) - elapsed
+                            progress_callback(percent, eta)
+                except ValueError:
+                    pass
+            elif line.startswith("progress=") and line.endswith("end"):
+                break
+        process.wait(timeout=3600)
+        if process.returncode != 0:
+            stderr = process.stderr.read() if process.stderr else ""
+            logger.error("ffmpeg failed (code %s): %s", process.returncode, stderr[-2000:])
+            return False
+        if progress_callback:
+            progress_callback(100.0, 0)
+        return output_path.exists() and output_path.stat().st_size > 0
+    except Exception as e:
+        logger.exception("ffmpeg error: %s", e)
+        return False
+
+
+def extract_audio_opus(input_path: Path, output_path: Path, progress_callback=None) -> bool:
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-vn", "-map", "0:a:0",
+        "-c:a", "libopus", "-b:a", "48k", "-ac", "1", "-application", "voip",
+        "-progress", "pipe:1", "-nostats", str(output_path),
+    ]
+    return _run_ffmpeg_with_progress(cmd, input_path, output_path, progress_callback)
+
+
+def extract_audio_mp3(input_path: Path, output_path: Path, progress_callback=None) -> bool:
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-vn", "-map", "0:a:0",
+        "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
+        "-progress", "pipe:1", "-nostats", str(output_path),
+    ]
+    return _run_ffmpeg_with_progress(cmd, input_path, output_path, progress_callback)
+
+
 class StatusEditor:
     """One in-flight edit_text per status message. Latest text wins."""
 
@@ -532,6 +616,150 @@ async def process_video(
                 shutil.rmtree(work_dir, ignore_errors=True)
 
 
+async def process_extract_audio(
+    target_message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    reply_to: Optional[Message] = None,
+) -> None:
+    if reply_to is None:
+        reply_to = target_message
+
+    chat_id = target_message.chat.id
+    info = _extract_video_info(target_message)
+    if not info:
+        return
+
+    file_id, duration, file_name, file_size = info
+    if duration and duration > MAX_DURATION_SECONDS:
+        await reply_to.reply_text(
+            f"⏭ Слишком длинное видео ({duration} с), лимит {MAX_DURATION_SECONDS} с."
+        )
+        return
+
+    status = StatusEditor()
+    work_dir: Optional[Path] = None
+
+    queued = compress_semaphore.locked()
+    if queued:
+        try:
+            status.attach(await reply_to.reply_text("⏳ В очереди на извлечение аудио…"))
+        except TelegramError as e:
+            logger.warning("Failed to send queue notice in chat %s: %s", chat_id, e)
+
+    async with compress_semaphore:
+        try:
+            start_text = "⏳ Извлекаю аудио…"
+            if status.msg is None:
+                status.attach(await reply_to.reply_text(start_text))
+            else:
+                await status.set_now(start_text)
+
+            work_dir = Path(tempfile.mkdtemp(prefix="aext_", dir=str(TMP_DIR)))
+            input_path = work_dir / "input"
+            opus_path = work_dir / "audio.ogg"
+            mp3_path = work_dir / "audio.mp3"
+
+            await status.set_now("⬇️ Скачиваю видео…")
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+            tg_file = await context.bot.get_file(file_id)
+            await tg_file.download_to_drive(custom_path=str(input_path))
+
+            if not input_path.exists() or input_path.stat().st_size == 0:
+                await status.set_now("❌ Не удалось скачать видео.")
+                return
+
+            if not duration:
+                duration = get_video_duration(input_path) or 0
+                if duration > MAX_DURATION_SECONDS:
+                    await status.set_now(
+                        f"⏭ Пропущено — длительность {duration:.0f} с "
+                        f"превышает лимит {MAX_DURATION_SECONDS} с."
+                    )
+                    return
+
+            if not has_audio_stream(input_path):
+                await status.set_now("❌ В этом видео нет аудиодорожки.")
+                return
+
+            last_edit = 0.0
+            loop = asyncio.get_running_loop()
+
+            def progress_cb(percent: float, eta: Optional[float]):
+                nonlocal last_edit
+                now = time.time()
+                if now - last_edit < 3.5 and percent < 99:
+                    return
+                last_edit = now
+                eta_str = f"~{int(eta)} с осталось" if eta and eta > 0 else "…"
+                text = f"🔄 Извлекаю аудио… *{percent:.0f}%* {eta_str}"
+                loop.call_soon_threadsafe(lambda t=text: status.set(t, progress=True))
+
+            await status.set_now("🔄 Кодирую в голосовое (OGG/Opus)…")
+            status.enable_progress()
+            success = await asyncio.to_thread(extract_audio_opus, input_path, opus_path, progress_cb)
+            status.disable_progress()
+            await status.wait()
+
+            if not success:
+                await status.set_now("❌ Не удалось извлечь аудио. Проверьте логи.")
+                return
+
+            sent = False
+            opus_size = opus_path.stat().st_size
+            stem = Path(file_name).stem
+
+            if opus_size <= VOICE_MAX_BYTES:
+                await status.set_now(f"⬆️ Отправляю голосовое… {_human_size(opus_size)}")
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+                try:
+                    with opus_path.open("rb") as f:
+                        await reply_to.reply_voice(
+                            voice=f,
+                            duration=int(duration) if duration else None,
+                            filename=stem + ".ogg",
+                        )
+                    sent = True
+                except TelegramError as e:
+                    logger.warning("reply_voice failed in chat %s: %s", chat_id, e)
+                    await status.set_now("ℹ️ Голосовое не отправилось, пробую аудиофайл…")
+
+            if not sent:
+                await status.set_now("🔄 Кодирую MP3…")
+                status.enable_progress()
+                mp3_ok = await asyncio.to_thread(extract_audio_mp3, input_path, mp3_path, progress_cb)
+                status.disable_progress()
+                await status.wait()
+                if not mp3_ok:
+                    await status.set_now("❌ Не удалось подготовить аудиофайл.")
+                    return
+                await status.set_now(f"⬆️ Отправляю аудиофайл… {_human_size(mp3_path.stat().st_size)}")
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+                with mp3_path.open("rb") as f:
+                    await reply_to.reply_audio(
+                        audio=f,
+                        duration=int(duration) if duration else None,
+                        filename=stem + ".mp3",
+                        title=stem,
+                    )
+
+            status.close()
+            if status.msg is not None:
+                try:
+                    await status.msg.delete()
+                except TelegramError:
+                    await _safe_edit(status.msg, "✅ Готово.")
+
+            logger.info("Extracted audio in chat %s from %s", chat_id, file_name)
+        except Exception as e:
+            logger.exception("Error extracting audio in chat %s: %s", chat_id, e)
+            await status.set_now(f"❌ Ошибка: {e}")
+        finally:
+            status.close()
+            if work_dir and work_dir.exists():
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -543,6 +771,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/add — Добавить *этот чат* в отслеживаемые\n"
         "/remove — Убрать *этот чат* из отслеживаемых\n"
         "/compress — Сжать видео (ответьте этой командой на сообщение с видео)\n"
+        "/extract_audio — Извлечь аудио из видео (ответьте командой на сообщение с видео)\n"
         "/status — Показать настройки и лимиты\n"
         "/settings — Посмотреть или изменить настройки этого чата\n"
         "/help — Это сообщение\n\n"
@@ -791,6 +1020,22 @@ async def compress_fps_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await process_video(replied, context, reply_to=message, fps=fps, settings=settings)
 
 
+async def extract_audio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message:
+        return
+    replied = message.reply_to_message
+    if not replied:
+        await message.reply_text(
+            "Ответьте командой /extract_audio на сообщение с видео."
+        )
+        return
+    if not _extract_video_info(replied):
+        await message.reply_text("В сообщении, на которое вы ответили, нет видео.")
+        return
+    await process_extract_audio(replied, context, reply_to=message)
+
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not message.chat:
@@ -825,7 +1070,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^settings:"))
     application.add_handler(CommandHandler("compress", compress_cmd))
     application.add_handler(CommandHandler("compress_fps", compress_fps_cmd))
-    application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, settings_value_reply))
+    application.add_handler(CommandHandler("extract_audio", extract_audio_cmd))
     application.add_handler(MessageHandler((filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, handle_video))
     logger.info(
         "Bot starting… max_duration=%ss, max_height=%s, crf=%s, concurrency=%s",
