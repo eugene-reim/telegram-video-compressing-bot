@@ -105,7 +105,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚀 Preset", callback_data="settings:preset"), InlineKeyboardButton("🔊 Аудио", callback_data="settings:audio")],
         [InlineKeyboardButton("⏱ Длительность", callback_data="settings:duration"), InlineKeyboardButton("🎞 FPS", callback_data="settings:fps")],
         [InlineKeyboardButton("♻️ Сбросить", callback_data="settings:reset")],
-        [InlineKeyboardButton("✖️ Закрыть", callback_data="settings:close")],
+        [InlineKeyboardButton("❌ Закрыть", callback_data="settings:close")],
     ])
 
 
@@ -122,7 +122,7 @@ def setting_options_keyboard(name: str) -> InlineKeyboardMarkup:
     rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
     rows.extend([
         [InlineKeyboardButton("⬅️ Назад", callback_data="settings:back")],
-        [InlineKeyboardButton("✖️ Закрыть", callback_data="settings:close")],
+        [InlineKeyboardButton("❌ Закрыть", callback_data="settings:close")],
     ])
     return InlineKeyboardMarkup(rows)
 
