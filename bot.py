@@ -88,9 +88,9 @@ def get_chat_settings(chat_id: int) -> CompressionSettings:
 def settings_text(settings: CompressionSettings) -> str:
     fps = f"{settings.fps} fps" if settings.fps else "без ограничения FPS"
     return (
-        "<b>⚙️ Настройки сжатия этого чата</b>\n\n"
-        f"• Лимит длительности: <b>{settings.max_duration_seconds} с</b>\n"
-        f"• Макс. высота: <b>{settings.max_height}p</b>\n"
+        "<b>⚙️ Настройки сжатия для этого чата</b>\n\n"
+        f"• Макс. длительность: <b>{settings.max_duration_seconds} с</b>\n"
+        f"• Макс. разрешение: <b>{settings.max_height}p</b>\n"
         f"• Качество CRF: <b>{settings.crf}</b>\n"
         f"• Пресет: <b>{settings.preset}</b>\n"
         f"• Аудио: <b>{settings.audio_bitrate}</b>\n"
@@ -101,7 +101,7 @@ def settings_text(settings: CompressionSettings) -> str:
 
 def settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📐 Высота", callback_data="settings:height"), InlineKeyboardButton("🎚 CRF", callback_data="settings:crf")],
+        [InlineKeyboardButton("📐 Разрешение", callback_data="settings:height"), InlineKeyboardButton("🎚 CRF", callback_data="settings:crf")],
         [InlineKeyboardButton("🚀 Preset", callback_data="settings:preset"), InlineKeyboardButton("🔊 Аудио", callback_data="settings:audio")],
         [InlineKeyboardButton("⏱ Длительность", callback_data="settings:duration"), InlineKeyboardButton("🎞 FPS", callback_data="settings:fps")],
         [InlineKeyboardButton("♻️ Сбросить", callback_data="settings:reset")],
@@ -125,10 +125,10 @@ def setting_options_keyboard(name: str) -> InlineKeyboardMarkup:
 
 def setting_label(name: str) -> str:
     return {
-        "height": "максимальную высоту в пикселях",
+        "height": "максимальное разрешение в пикселях",
         "crf": "CRF от 0 до 51",
         "audio": "битрейт аудио, например 96k",
-        "duration": "лимит длительности в секундах",
+        "duration": "максимальная длительность в секундах",
         "fps": "FPS от 0 до 60",
     }[name]
 
@@ -833,9 +833,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     text = (
         "⚙️ *Статус бота*\n\n"
         f"• Отслеживаемые чаты: *{len(monitored_chats)}*\n"
-        f"• Макс. длительность этого чата: *{settings.max_duration_seconds} с* "
+        f"- Настройки этого чата:\n"
+        f"• Макс. длительность: *{settings.max_duration_seconds} с* "
         f"({settings.max_duration_seconds // 60} мин)\n"
-        f"• Макс. высота этого чата: *{settings.max_height}p*\n"
+        f"• Макс. разрешение: *{settings.max_height}p*\n"
         f"• CRF (качество): *{settings.crf}* (выше = меньше файл)\n"
         f"• Пресет: *{settings.preset}*\n"
         f"• Битрейт аудио: *{settings.audio_bitrate}*\n"
@@ -861,7 +862,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         chat_settings.pop(chat_id, None)
         save_chat_settings()
         await message.reply_text(
-            "✅ Настройки этого чата сброшены.\n\n" + settings_text(CompressionSettings()),
+            "✅ Настройки для этого чата были сброшены.\n\n" + settings_text(CompressionSettings()),
             parse_mode=ParseMode.HTML,
             reply_markup=settings_keyboard(),
         )
@@ -881,7 +882,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_settings[chat_id] = updated
     save_chat_settings()
     await message.reply_text(
-        "✅ Настройки сохранены.\n\n" + settings_text(updated),
+        "✅ Настройки для этого чата были сохранены.\n\n" + settings_text(updated),
         parse_mode=ParseMode.HTML,
         reply_markup=settings_keyboard(),
     )
@@ -910,7 +911,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         chat_settings.pop(chat_id, None)
         save_chat_settings()
         await query.edit_message_text(
-            "✅ Настройки сброшены.\n\n" + settings_text(CompressionSettings()),
+            "✅ Настройки для этого чата были сброшены.\n\n" + settings_text(CompressionSettings()),
             parse_mode=ParseMode.HTML,
             reply_markup=settings_keyboard(),
         )
@@ -933,7 +934,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer()
         user_data["pending_setting"] = name
         await callback_message.reply_text(
-            f"Введите {setting_label(name)} одним сообщением:",
+            f"Введите {setting_label(name)} в ответ на это сообщение:",
             reply_markup=ForceReply(selective=True),
         )
         return
@@ -946,7 +947,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     save_chat_settings()
     await query.answer()
     await query.edit_message_text(
-        "✅ Настройки сохранены.\n\n" + settings_text(updated),
+        "✅ Настройки для этого чата были сохранены.\n\n" + settings_text(updated),
         parse_mode=ParseMode.HTML,
         reply_markup=settings_keyboard(),
     )
@@ -970,7 +971,7 @@ async def settings_value_reply(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_settings[message.chat.id] = updated
     save_chat_settings()
     await message.reply_text(
-        "✅ Настройки сохранены.\n\n" + settings_text(updated),
+        "✅ Настройки для этого чата были сохранены.\n\n" + settings_text(updated),
         parse_mode=ParseMode.HTML,
         reply_markup=settings_keyboard(),
     )
