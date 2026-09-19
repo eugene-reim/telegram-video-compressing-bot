@@ -5,15 +5,17 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional, Set, Tuple
+from typing import Any, Optional, Set, Tuple
 
 from dotenv import load_dotenv
-from telegram import Update, Message
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Message, ForceReply
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -21,6 +23,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    CallbackQueryHandler,
     MessageHandler,
     filters,
 )
@@ -37,7 +40,7 @@ request = HTTPXRequest(
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN environment variable is required")
 
@@ -52,6 +55,7 @@ COMPRESS_CONCURRENCY = max(1, int(os.getenv("COMPRESS_CONCURRENCY", "1")))
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 TMP_DIR = Path(os.getenv("TMP_DIR", "/app/tmp"))
 MONITORED_FILE = DATA_DIR / "monitored_chats.json"
+CHAT_SETTINGS_FILE = DATA_DIR / "chat_settings.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -63,7 +67,132 @@ logging.basicConfig(
 logger = logging.getLogger("video-compressor-bot")
 
 monitored_chats: Set[int] = set()
+chat_settings: dict[int, "CompressionSettings"] = {}
 compress_semaphore = asyncio.Semaphore(COMPRESS_CONCURRENCY)
+
+
+@dataclass(frozen=True)
+class CompressionSettings:
+    max_duration_seconds: int = MAX_DURATION_SECONDS
+    max_height: int = MAX_HEIGHT
+    crf: int = CRF
+    preset: str = PRESET
+    audio_bitrate: str = AUDIO_BITRATE
+    fps: int = 0
+
+
+def get_chat_settings(chat_id: int) -> CompressionSettings:
+    return chat_settings.get(chat_id, CompressionSettings())
+
+
+def settings_text(settings: CompressionSettings) -> str:
+    fps = f"{settings.fps} fps" if settings.fps else "без ограничения FPS"
+    return (
+        "<b>⚙️ Настройки сжатия этого чата</b>\n\n"
+        f"• Лимит длительности: <b>{settings.max_duration_seconds} с</b>\n"
+        f"• Макс. высота: <b>{settings.max_height}p</b>\n"
+        f"• Качество CRF: <b>{settings.crf}</b>\n"
+        f"• Пресет: <b>{settings.preset}</b>\n"
+        f"• Аудио: <b>{settings.audio_bitrate}</b>\n"
+        f"• FPS: <b>{fps}</b>\n\n"
+        "Выберите параметр ниже. Для своего значения нажмите «Другое»."
+    )
+
+
+def settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📐 Высота", callback_data="settings:height"), InlineKeyboardButton("🎚 CRF", callback_data="settings:crf")],
+        [InlineKeyboardButton("🚀 Preset", callback_data="settings:preset"), InlineKeyboardButton("🔊 Аудио", callback_data="settings:audio")],
+        [InlineKeyboardButton("⏱ Длительность", callback_data="settings:duration"), InlineKeyboardButton("🎞 FPS", callback_data="settings:fps")],
+        [InlineKeyboardButton("♻️ Сбросить", callback_data="settings:reset")],
+    ])
+
+
+def setting_options_keyboard(name: str) -> InlineKeyboardMarkup:
+    options = {
+        "height": [("360p", "360"), ("480p", "480"), ("720p", "720"), ("1080p", "1080"), ("Другое", "custom")],
+        "crf": [("23", "23"), ("28", "28"), ("32", "32"), ("36", "36"), ("Другое", "custom")],
+        "preset": [("fast", "fast"), ("medium", "medium"), ("slow", "slow"), ("veryslow", "veryslow")],
+        "audio": [("64k", "64k"), ("96k", "96k"), ("128k", "128k"), ("192k", "192k"), ("Другое", "custom")],
+        "duration": [("5 мин", "300"), ("10 мин", "600"), ("20 мин", "1200"), ("60 мин", "3600"), ("Другое", "custom")],
+        "fps": [("Без лимита", "0"), ("24", "24"), ("30", "30"), ("60", "60"), ("Другое", "custom")],
+    }
+    buttons = [InlineKeyboardButton(label, callback_data=f"settings:set:{name}:{value}") for label, value in options[name]]
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def setting_label(name: str) -> str:
+    return {
+        "height": "максимальную высоту в пикселях",
+        "crf": "CRF от 0 до 51",
+        "audio": "битрейт аудио, например 96k",
+        "duration": "лимит длительности в секундах",
+        "fps": "FPS от 0 до 60",
+    }[name]
+
+
+def parse_setting(name: str, value: str, current: CompressionSettings) -> CompressionSettings:
+    values: dict[str, Any] = asdict(current)
+    if name == "duration":
+        parsed = int(value)
+        if not 1 <= parsed <= 86400:
+            raise ValueError("duration должен быть от 1 до 86400 секунд")
+        values["max_duration_seconds"] = parsed
+    elif name == "height":
+        parsed = int(value)
+        if not 144 <= parsed <= 4320:
+            raise ValueError("height должен быть от 144 до 4320")
+        values["max_height"] = parsed
+    elif name == "crf":
+        parsed = int(value)
+        if not 0 <= parsed <= 51:
+            raise ValueError("crf должен быть от 0 до 51")
+        values["crf"] = parsed
+    elif name == "preset":
+        if value not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}:
+            raise ValueError("preset: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower или veryslow")
+        values["preset"] = value
+    elif name == "audio":
+        if not re.fullmatch(r"(?:\d{1,3})k", value) or not 16 <= int(value[:-1]) <= 512:
+            raise ValueError("audio должен быть в формате 16k-512k")
+        values["audio_bitrate"] = value
+    elif name == "fps":
+        parsed = int(value)
+        if not 0 <= parsed <= 60:
+            raise ValueError("fps должен быть от 0 до 60; 0 отключает ограничение")
+        values["fps"] = parsed
+    else:
+        raise ValueError("неизвестное поле")
+    return CompressionSettings(**values)
+
+
+def save_chat_settings() -> None:
+    try:
+        CHAT_SETTINGS_FILE.write_text(
+            json.dumps({str(chat_id): asdict(settings) for chat_id, settings in chat_settings.items()}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.error("Failed to save chat settings: %s", e)
+
+
+def load_chat_settings() -> None:
+    global chat_settings
+    if not CHAT_SETTINGS_FILE.exists():
+        chat_settings = {}
+        return
+    try:
+        data = json.loads(CHAT_SETTINGS_FILE.read_text(encoding="utf-8"))
+        loaded: dict[int, CompressionSettings] = {}
+        for chat_id, values in data.items():
+            loaded[int(chat_id)] = CompressionSettings(**values)
+        chat_settings = loaded
+        logger.info("Loaded settings for %d chat(s)", len(chat_settings))
+    except Exception as e:
+        logger.error("Failed to load chat settings: %s", e)
+        chat_settings = {}
 
 
 def load_monitored() -> None:
@@ -106,15 +235,21 @@ def get_video_duration(path: Path) -> Optional[float]:
     return None
 
 
-def compress_video(input_path: Path, output_path: Path, progress_callback=None, fps: int = 0) -> bool:
-    filters = [f"scale=-2:'min({MAX_HEIGHT},ih)'"]
+def compress_video(
+    input_path: Path,
+    output_path: Path,
+    settings: CompressionSettings,
+    progress_callback=None,
+    fps: int = 0,
+) -> bool:
+    filters = [f"scale=-2:'min({settings.max_height},ih)'"]
     if fps > 0:
         filters.append(f"fps={fps}")
     vf = ",".join(filters)
     cmd = [
         "ffmpeg", "-y", "-i", str(input_path),
-        "-c:v", "libx264", "-crf", str(CRF), "-preset", PRESET, "-vf", vf,
-        "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-movflags", "+faststart",
+        "-c:v", "libx264", "-crf", str(settings.crf), "-preset", settings.preset, "-vf", vf,
+        "-c:a", "aac", "-b:a", settings.audio_bitrate, "-movflags", "+faststart",
         "-progress", "pipe:1", "-nostats", str(output_path),
     ]
     logger.info("Running ffmpeg: %s", " ".join(cmd))
@@ -123,6 +258,8 @@ def compress_video(input_path: Path, output_path: Path, progress_callback=None, 
         duration = get_video_duration(input_path) or 0.0
         last_percent = -1.0
         start_time = time.time()
+        if process.stdout is None:
+            raise RuntimeError("ffmpeg stdout is unavailable")
         while True:
             line = process.stdout.readline()
             if not line and process.poll() is not None:
@@ -257,18 +394,20 @@ async def process_video(
     *,
     reply_to: Optional[Message] = None,
     fps: int = 0,
+    settings: Optional[CompressionSettings] = None,
 ) -> None:
     if reply_to is None:
         reply_to = target_message
 
     chat_id = target_message.chat.id
+    settings = settings or get_chat_settings(chat_id)
     info = _extract_video_info(target_message)
     if not info:
         return
 
     file_id, duration, file_name, file_size = info
-    if duration and duration > MAX_DURATION_SECONDS:
-        logger.info("Skipping video in chat %s: duration %ss > limit %ss", chat_id, duration, MAX_DURATION_SECONDS)
+    if duration and duration > settings.max_duration_seconds:
+        logger.info("Skipping video in chat %s: duration %ss > limit %ss", chat_id, duration, settings.max_duration_seconds)
         return
 
     status = StatusEditor()
@@ -309,10 +448,10 @@ async def process_video(
 
             if not duration:
                 duration = get_video_duration(input_path) or 0
-                if duration > MAX_DURATION_SECONDS:
+                if duration > settings.max_duration_seconds:
                     await status.set_now(
                         f"⏭ Пропущено — длительность {duration:.0f} с "
-                        f"превышает лимит {MAX_DURATION_SECONDS} с."
+                        f"превышает лимит {settings.max_duration_seconds} с."
                     )
                     return
 
@@ -335,11 +474,12 @@ async def process_video(
             fps_info = f" / {fps} fps" if fps > 0 else ""
             await status.set_now(
                 f"🔄 Сжимаю…\nОригинал: {_human_size(original_size)}\n"
-                f"Настройки: {MAX_HEIGHT}p / CRF {CRF} / {PRESET}{fps_info}"
+                f"Настройки: {settings.max_height}p / CRF {settings.crf} / {settings.preset}"
+                f" / {settings.audio_bitrate}{fps_info}"
             )
             status.enable_progress()
 
-            success = await asyncio.to_thread(compress_video, input_path, output_path, progress_cb, fps)
+            success = await asyncio.to_thread(compress_video, input_path, output_path, settings, progress_cb, fps)
 
             status.disable_progress()
             await status.wait()
@@ -393,6 +533,8 @@ async def process_video(
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
     text = (
         "🎥 *Жмыхач*\n\n"
         "Я автоматически сжимаю видео в отслеживаемых чатах "
@@ -402,6 +544,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/remove — Убрать *этот чат* из отслеживаемых\n"
         "/compress — Сжать видео (ответьте этой командой на сообщение с видео)\n"
         "/status — Показать настройки и лимиты\n"
+        "/settings — Посмотреть или изменить настройки этого чата\n"
         "/help — Это сообщение\n\n"
         "⚠️ Если бот не видит обычные сообщения — отключите Privacy Mode "
         "в @BotFather (`/setprivacy` → Disable). "
@@ -416,16 +559,17 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def add_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    if not chat:
+    message = update.message
+    if not chat or not message:
         return
     chat_id = chat.id
     if chat_id in monitored_chats:
-        await update.message.reply_text("✅ Этот чат уже отслеживается.")
+        await message.reply_text("✅ Этот чат уже отслеживается.")
         return
     monitored_chats.add(chat_id)
     save_monitored()
     title = chat.title or chat.full_name or str(chat_id)
-    await update.message.reply_text(
+    await message.reply_text(
         f"✅ Чат *{title}* добавлен в отслеживаемые.\n"
         f"Я буду автоматически сжимать все новые видео!",
         parse_mode=ParseMode.MARKDOWN,
@@ -435,16 +579,17 @@ async def add_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def remove_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    if not chat:
+    message = update.message
+    if not chat or not message:
         return
     chat_id = chat.id
     if chat_id not in monitored_chats:
-        await update.message.reply_text("ℹ️ Этот чат не отслеживается.")
+        await message.reply_text("ℹ️ Этот чат не отслеживается.")
         return
     monitored_chats.discard(chat_id)
     save_monitored()
     title = chat.title or chat.full_name or str(chat_id)
-    await update.message.reply_text(
+    await message.reply_text(
         f"🗑 Удалён *{title}* (`{chat_id}`) из отслеживаемых.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -452,18 +597,154 @@ async def remove_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message:
+        return
+    settings = get_chat_settings(message.chat.id)
     text = (
         "⚙️ *Статус бота*\n\n"
         f"• Отслеживаемые чаты: *{len(monitored_chats)}*\n"
-        f"• Макс. длительность: *{MAX_DURATION_SECONDS} с* "
-        f"({MAX_DURATION_SECONDS // 60} мин)\n"
-        f"• Макс. высота: *{MAX_HEIGHT}p*\n"
-        f"• CRF (качество): *{CRF}* (выше = меньше файл)\n"
-        f"• Пресет: *{PRESET}*\n"
-        f"• Битрейт аудио: *{AUDIO_BITRATE}*\n"
+        f"• Макс. длительность этого чата: *{settings.max_duration_seconds} с* "
+        f"({settings.max_duration_seconds // 60} мин)\n"
+        f"• Макс. высота этого чата: *{settings.max_height}p*\n"
+        f"• CRF (качество): *{settings.crf}* (выше = меньше файл)\n"
+        f"• Пресет: *{settings.preset}*\n"
+        f"• Битрейт аудио: *{settings.audio_bitrate}*\n"
+        f"• FPS: *{settings.fps or 'без ограничения'}*\n"
         f"• Одновременных сжатий: *{COMPRESS_CONCURRENCY}*\n"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not message.chat:
+        return
+    chat_id = message.chat.id
+    if not context.args:
+        await message.reply_text(
+            settings_text(get_chat_settings(chat_id)),
+            parse_mode=ParseMode.HTML,
+            reply_markup=settings_keyboard(),
+        )
+        return
+    if context.args[0].lower() == "reset":
+        chat_settings.pop(chat_id, None)
+        save_chat_settings()
+        await message.reply_text(
+            "✅ Настройки этого чата сброшены.\n\n" + settings_text(CompressionSettings()),
+            parse_mode=ParseMode.HTML,
+            reply_markup=settings_keyboard(),
+        )
+        return
+    if len(context.args) != 2:
+        await message.reply_text("Использование: /settings поле значение или /settings reset")
+        return
+    try:
+        updated = parse_setting(context.args[0].lower(), context.args[1].lower(), get_chat_settings(chat_id))
+    except (TypeError, ValueError) as e:
+        await message.reply_text(
+            f"❌ {e}\n\n{settings_text(get_chat_settings(chat_id))}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=settings_keyboard(),
+        )
+        return
+    chat_settings[chat_id] = updated
+    save_chat_settings()
+    await message.reply_text(
+        "✅ Настройки сохранены.\n\n" + settings_text(updated),
+        parse_mode=ParseMode.HTML,
+        reply_markup=settings_keyboard(),
+    )
+
+
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not isinstance(query.message, Message):
+        return
+    callback_message = query.message
+    user_data = context.user_data
+    if user_data is None:
+        return
+    chat_id = callback_message.chat.id
+    data = query.data or ""
+    if data == "settings:back":
+        await query.answer()
+        await query.edit_message_text(
+            settings_text(get_chat_settings(chat_id)),
+            parse_mode=ParseMode.HTML,
+            reply_markup=settings_keyboard(),
+        )
+        return
+    if data == "settings:reset":
+        await query.answer()
+        chat_settings.pop(chat_id, None)
+        save_chat_settings()
+        await query.edit_message_text(
+            "✅ Настройки сброшены.\n\n" + settings_text(CompressionSettings()),
+            parse_mode=ParseMode.HTML,
+            reply_markup=settings_keyboard(),
+        )
+        return
+    parts = data.split(":")
+    if len(parts) == 2 and parts[0] == "settings":
+        name = parts[1]
+        if name in {"height", "crf", "audio", "duration", "fps", "preset"}:
+            await query.answer()
+            await query.edit_message_text(
+                f"<b>Изменение параметра: {name}</b>\n\nВыберите значение:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=setting_options_keyboard(name),
+            )
+        return
+    if len(parts) != 4 or parts[:2] != ["settings", "set"]:
+        return
+    name, value = parts[2:]
+    if value == "custom":
+        await query.answer()
+        user_data["pending_setting"] = name
+        await callback_message.reply_text(
+            f"Введите {setting_label(name)} одним сообщением:",
+            reply_markup=ForceReply(selective=True),
+        )
+        return
+    try:
+        updated = parse_setting(name, value, get_chat_settings(chat_id))
+    except (TypeError, ValueError) as e:
+        await query.answer(str(e), show_alert=True)
+        return
+    chat_settings[chat_id] = updated
+    save_chat_settings()
+    await query.answer()
+    await query.edit_message_text(
+        "✅ Настройки сохранены.\n\n" + settings_text(updated),
+        parse_mode=ParseMode.HTML,
+        reply_markup=settings_keyboard(),
+    )
+
+
+async def settings_value_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user_data = context.user_data
+    name = user_data.pop("pending_setting", None) if user_data is not None else None
+    if not message or not name or not message.reply_to_message:
+        return
+    if not message.reply_to_message.from_user or not message.reply_to_message.from_user.is_bot:
+        return
+    if not message.text:
+        return
+    try:
+        updated = parse_setting(name, message.text.strip().lower(), get_chat_settings(message.chat.id))
+    except (TypeError, ValueError) as e:
+        await message.reply_text(f"❌ {e}. Нажмите /settings и попробуйте снова.")
+        return
+    chat_settings[message.chat.id] = updated
+    save_chat_settings()
+    await message.reply_text(
+        "✅ Настройки сохранены.\n\n" + settings_text(updated),
+        parse_mode=ParseMode.HTML,
+        reply_markup=settings_keyboard(),
+    )
 
 
 async def compress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -497,7 +778,8 @@ async def compress_fps_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not _extract_video_info(replied):
         await message.reply_text("В сообщении, на которое вы ответили, нет видео.")
         return
-    fps = DEFAULT_FPS
+    settings = get_chat_settings(message.chat.id)
+    fps = settings.fps or DEFAULT_FPS
     if context.args:
         try:
             fps = int(context.args[0])
@@ -506,7 +788,7 @@ async def compress_fps_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except ValueError:
             await message.reply_text("FPS должен быть числом от 1 до 60.")
             return
-    await process_video(replied, context, reply_to=message, fps=fps)
+    await process_video(replied, context, reply_to=message, fps=fps, settings=settings)
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -524,6 +806,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def main() -> None:
     load_monitored()
+    load_chat_settings()
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -538,8 +821,11 @@ def main() -> None:
     application.add_handler(CommandHandler("add", add_chat))
     application.add_handler(CommandHandler("remove", remove_chat))
     application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("settings", settings_cmd))
+    application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^settings:"))
     application.add_handler(CommandHandler("compress", compress_cmd))
     application.add_handler(CommandHandler("compress_fps", compress_fps_cmd))
+    application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, settings_value_reply))
     application.add_handler(MessageHandler((filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, handle_video))
     logger.info(
         "Bot starting… max_duration=%ss, max_height=%s, crf=%s, concurrency=%s",
