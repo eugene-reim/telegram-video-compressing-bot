@@ -1071,6 +1071,7 @@ def main() -> None:
     application.add_handler(CommandHandler("compress", compress_cmd))
     application.add_handler(CommandHandler("compress_fps", compress_fps_cmd))
     application.add_handler(CommandHandler("extract_audio", extract_audio_cmd))
+    application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, settings_value_reply))
     application.add_handler(MessageHandler((filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, handle_video))
     logger.info(
         "Bot starting… max_duration=%ss, max_height=%s, crf=%s, concurrency=%s",
