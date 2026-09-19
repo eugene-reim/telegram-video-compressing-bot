@@ -40,8 +40,8 @@ ENV PATH="/app/.venv/bin:$PATH" \
     DATA_DIR=/app/data \
     TMP_DIR=/app/tmp
 
-# Application code (only the bot itself)
-COPY bot.py .
+# Application code
+COPY bot.py config.py media.py models.py settings_ui.py status.py storage.py ./
 
 # Directories for persistent data and temporary files
 RUN mkdir -p /app/data /app/tmp && \

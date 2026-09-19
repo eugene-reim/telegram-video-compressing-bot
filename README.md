@@ -51,6 +51,16 @@ docker compose up -d --build
 также отключает ограничение FPS, а `/settings reset` возвращает значения из `.env`.
 Настройки хранятся в `data/chat_settings.json`.
 
+## Структура проекта
+
+- `bot.py` — Telegram-команды, callbacks и orchestration
+- `config.py` — переменные окружения и пути приложения
+- `models.py` — общие модели настроек и видео
+- `storage.py` — JSON-хранилища чатов и настроек
+- `settings_ui.py` — HTML-текст, клавиатуры и валидация настроек
+- `media.py` — ffmpeg/ffprobe и извлечение информации о видео
+- `status.py` — последовательное обновление статусных сообщений
+
 ## Команды
 
 | Команда      | Описание                                              |

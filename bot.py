@@ -2,478 +2,87 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
-import re
 import shutil
-import subprocess
 import tempfile
 import time
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional, Set, Tuple
-
-from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Message, ForceReply
+from typing import Optional
+from telegram import ForceReply, Message, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     AIORateLimiter,
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    CallbackQueryHandler,
     MessageHandler,
     filters,
 )
 from telegram.request import HTTPXRequest
 
-request = HTTPXRequest(
-    connection_pool_size=8,
-    connect_timeout=30.0,
-    read_timeout=30.0,
-    write_timeout=60.0,
-    pool_timeout=30.0,
+from config import load_config
+from media import VOICE_MAX_BYTES, compress_video, extract_audio_mp3, extract_audio_opus, extract_video_info, get_video_duration, has_audio_stream, human_size
+from models import CompressionSettings
+from settings_ui import parse_setting, setting_label, setting_options_keyboard, settings_keyboard, settings_text
+from status import StatusEditor, safe_edit
+from storage import (
+    load_chat_settings as load_chat_settings_file,
+    load_monitored as load_monitored_file,
+    save_chat_settings as save_chat_settings_file,
+    save_monitored as save_monitored_file,
 )
 
+request = HTTPXRequest(connection_pool_size=8, connect_timeout=30.0, read_timeout=30.0, write_timeout=60.0, pool_timeout=30.0)
+config = load_config()
+BOT_TOKEN = config.bot_token
+MAX_DURATION_SECONDS = config.max_duration_seconds
+DEFAULT_FPS = config.default_fps
+COMPRESS_CONCURRENCY = config.compress_concurrency
+TMP_DIR = config.tmp_dir
 
-load_dotenv()
-
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
-if not BOT_TOKEN:
-    raise SystemExit("BOT_TOKEN environment variable is required")
-
-MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "600"))
-CRF = int(os.getenv("CRF", "28"))
-MAX_HEIGHT = int(os.getenv("MAX_HEIGHT", "720"))
-AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
-PRESET = os.getenv("PRESET", "medium")
-DEFAULT_FPS = int(os.getenv("DEFAULT_FPS", "30"))
-COMPRESS_CONCURRENCY = max(1, int(os.getenv("COMPRESS_CONCURRENCY", "1")))
-
-DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
-TMP_DIR = Path(os.getenv("TMP_DIR", "/app/tmp"))
-MONITORED_FILE = DATA_DIR / "monitored_chats.json"
-CHAT_SETTINGS_FILE = DATA_DIR / "chat_settings.json"
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger("video-compressor-bot")
-
-monitored_chats: Set[int] = set()
-chat_settings: dict[int, "CompressionSettings"] = {}
+monitored_chats: set[int] = set()
+chat_settings: dict[int, CompressionSettings] = {}
 compress_semaphore = asyncio.Semaphore(COMPRESS_CONCURRENCY)
+default_settings = CompressionSettings(
+    max_duration_seconds=config.max_duration_seconds,
+    max_height=config.max_height,
+    crf=config.crf,
+    preset=config.preset,
+    audio_bitrate=config.audio_bitrate,
+)
+_extract_video_info = extract_video_info
+_human_size = human_size
+_safe_edit = safe_edit
 
 
-@dataclass(frozen=True)
-class CompressionSettings:
-    max_duration_seconds: int = MAX_DURATION_SECONDS
-    max_height: int = MAX_HEIGHT
-    crf: int = CRF
-    preset: str = PRESET
-    audio_bitrate: str = AUDIO_BITRATE
-    fps: int = 0
+def extract_audio_mp3_for_config(input_path: Path, output_path: Path, progress_callback=None) -> bool:
+    return extract_audio_mp3(input_path, output_path, config.audio_bitrate, progress_callback)
 
 
 def get_chat_settings(chat_id: int) -> CompressionSettings:
-    return chat_settings.get(chat_id, CompressionSettings())
-
-
-def settings_text(settings: CompressionSettings) -> str:
-    fps = f"{settings.fps} fps" if settings.fps else "без ограничения FPS"
-    return (
-        "<b>⚙️ Настройки сжатия для этого чата</b>\n\n"
-        f"• Макс. длительность: <b>{settings.max_duration_seconds} с</b>\n"
-        f"• Макс. разрешение: <b>{settings.max_height}p</b>\n"
-        f"• Качество CRF: <b>{settings.crf}</b>\n"
-        f"• Пресет: <b>{settings.preset}</b>\n"
-        f"• Аудио: <b>{settings.audio_bitrate}</b>\n"
-        f"• FPS: <b>{fps}</b>\n\n"
-        "Выберите параметр ниже. Для своего значения нажмите «Другое»."
-    )
-
-
-def settings_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📐 Разрешение", callback_data="settings:height"), InlineKeyboardButton("🎚 CRF", callback_data="settings:crf")],
-        [InlineKeyboardButton("🚀 Preset", callback_data="settings:preset"), InlineKeyboardButton("🔊 Аудио", callback_data="settings:audio")],
-        [InlineKeyboardButton("⏱ Длительность", callback_data="settings:duration"), InlineKeyboardButton("🎞 FPS", callback_data="settings:fps")],
-        [InlineKeyboardButton("♻️ Сбросить", callback_data="settings:reset")],
-        [InlineKeyboardButton("❌ Закрыть", callback_data="settings:close")],
-    ])
-
-
-def setting_options_keyboard(name: str) -> InlineKeyboardMarkup:
-    options = {
-        "height": [("360p", "360"), ("480p", "480"), ("720p", "720"), ("1080p", "1080"), ("Другое", "custom")],
-        "crf": [("23", "23"), ("28", "28"), ("32", "32"), ("36", "36"), ("Другое", "custom")],
-        "preset": [("fast", "fast"), ("medium", "medium"), ("slow", "slow"), ("veryslow", "veryslow")],
-        "audio": [("64k", "64k"), ("96k", "96k"), ("128k", "128k"), ("192k", "192k"), ("Другое", "custom")],
-        "duration": [("5 мин", "300"), ("10 мин", "600"), ("20 мин", "1200"), ("60 мин", "3600"), ("Другое", "custom")],
-        "fps": [("Без лимита", "0"), ("24", "24"), ("30", "30"), ("60", "60"), ("Другое", "custom")],
-    }
-    buttons = [InlineKeyboardButton(label, callback_data=f"settings:set:{name}:{value}") for label, value in options[name]]
-    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
-    rows.extend([
-        [InlineKeyboardButton("⬅️ Назад", callback_data="settings:back")],
-        [InlineKeyboardButton("❌ Закрыть", callback_data="settings:close")],
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
-def setting_label(name: str) -> str:
-    return {
-        "height": "максимальное разрешение в пикселях",
-        "crf": "CRF от 0 до 51",
-        "audio": "битрейт аудио, например 96k",
-        "duration": "максимальная длительность в секундах",
-        "fps": "FPS от 0 до 60",
-    }[name]
-
-
-def parse_setting(name: str, value: str, current: CompressionSettings) -> CompressionSettings:
-    values: dict[str, Any] = asdict(current)
-    if name == "duration":
-        parsed = int(value)
-        if not 1 <= parsed <= 86400:
-            raise ValueError("duration должен быть от 1 до 86400 секунд")
-        values["max_duration_seconds"] = parsed
-    elif name == "height":
-        parsed = int(value)
-        if not 144 <= parsed <= 4320:
-            raise ValueError("height должен быть от 144 до 4320")
-        values["max_height"] = parsed
-    elif name == "crf":
-        parsed = int(value)
-        if not 0 <= parsed <= 51:
-            raise ValueError("crf должен быть от 0 до 51")
-        values["crf"] = parsed
-    elif name == "preset":
-        if value not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}:
-            raise ValueError("preset: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower или veryslow")
-        values["preset"] = value
-    elif name == "audio":
-        if not re.fullmatch(r"(?:\d{1,3})k", value) or not 16 <= int(value[:-1]) <= 512:
-            raise ValueError("audio должен быть в формате 16k-512k")
-        values["audio_bitrate"] = value
-    elif name == "fps":
-        parsed = int(value)
-        if not 0 <= parsed <= 60:
-            raise ValueError("fps должен быть от 0 до 60; 0 отключает ограничение")
-        values["fps"] = parsed
-    else:
-        raise ValueError("неизвестное поле")
-    return CompressionSettings(**values)
-
-
-def save_chat_settings() -> None:
-    try:
-        CHAT_SETTINGS_FILE.write_text(
-            json.dumps({str(chat_id): asdict(settings) for chat_id, settings in chat_settings.items()}, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        logger.error("Failed to save chat settings: %s", e)
-
-
-def load_chat_settings() -> None:
-    global chat_settings
-    if not CHAT_SETTINGS_FILE.exists():
-        chat_settings = {}
-        return
-    try:
-        data = json.loads(CHAT_SETTINGS_FILE.read_text(encoding="utf-8"))
-        loaded: dict[int, CompressionSettings] = {}
-        for chat_id, values in data.items():
-            loaded[int(chat_id)] = CompressionSettings(**values)
-        chat_settings = loaded
-        logger.info("Loaded settings for %d chat(s)", len(chat_settings))
-    except Exception as e:
-        logger.error("Failed to load chat settings: %s", e)
-        chat_settings = {}
+    return chat_settings.get(chat_id, default_settings)
 
 
 def load_monitored() -> None:
     global monitored_chats
-    if MONITORED_FILE.exists():
-        try:
-            data = json.loads(MONITORED_FILE.read_text(encoding="utf-8"))
-            monitored_chats = set(int(x) for x in data)
-            logger.info("Loaded %d monitored chat(s)", len(monitored_chats))
-        except Exception as e:
-            logger.error("Failed to load monitored chats: %s", e)
-            monitored_chats = set()
-    else:
-        monitored_chats = set()
+    monitored_chats = load_monitored_file(config.monitored_file)
 
 
 def save_monitored() -> None:
-    try:
-        MONITORED_FILE.write_text(
-            json.dumps(sorted(monitored_chats), indent=2),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        logger.error("Failed to save monitored chats: %s", e)
+    save_monitored_file(config.monitored_file, monitored_chats)
 
 
-def get_video_duration(path: Path) -> Optional[float]:
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1", str(path),
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return float(result.stdout.strip())
-    except Exception as e:
-        logger.warning("ffprobe failed: %s", e)
-    return None
+def load_chat_settings() -> None:
+    global chat_settings
+    chat_settings = load_chat_settings_file(config.chat_settings_file)
 
 
-def compress_video(
-    input_path: Path,
-    output_path: Path,
-    settings: CompressionSettings,
-    progress_callback=None,
-    fps: int = 0,
-) -> bool:
-    filters = [f"scale=-2:'min({settings.max_height},ih)'"]
-    if fps > 0:
-        filters.append(f"fps={fps}")
-    vf = ",".join(filters)
-    cmd = [
-        "ffmpeg", "-y", "-i", str(input_path),
-        "-c:v", "libx264", "-crf", str(settings.crf), "-preset", settings.preset, "-vf", vf,
-        "-c:a", "aac", "-b:a", settings.audio_bitrate, "-movflags", "+faststart",
-        "-progress", "pipe:1", "-nostats", str(output_path),
-    ]
-    logger.info("Running ffmpeg: %s", " ".join(cmd))
-    try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-        duration = get_video_duration(input_path) or 0.0
-        last_percent = -1.0
-        start_time = time.time()
-        if process.stdout is None:
-            raise RuntimeError("ffmpeg stdout is unavailable")
-        while True:
-            line = process.stdout.readline()
-            if not line and process.poll() is not None:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("out_time_ms="):
-                try:
-                    out_ms = int(line.split("=", 1)[1])
-                    if duration > 0:
-                        percent = min(99.0, (out_ms / 1_000_000) / duration * 100)
-                        if progress_callback and abs(percent - last_percent) >= 2.0:
-                            last_percent = percent
-                            eta = None
-                            if percent > 1:
-                                elapsed = time.time() - start_time
-                                eta = (elapsed / (percent / 100)) - elapsed
-                            progress_callback(percent, eta)
-                except ValueError:
-                    pass
-            elif line.startswith("progress=") and line.endswith("end"):
-                break
-        process.wait(timeout=3600)
-        if process.returncode != 0:
-            stderr = process.stderr.read() if process.stderr else ""
-            logger.error("ffmpeg failed (code %s): %s", process.returncode, stderr[-2000:])
-            return False
-        if progress_callback:
-            progress_callback(100.0, 0)
-        return output_path.exists() and output_path.stat().st_size > 0
-    except Exception as e:
-        logger.exception("Compression error: %s", e)
-        return False
-
-
-VOICE_MAX_BYTES = 50 * 1024 * 1024
-
-
-def has_audio_stream(path: Path) -> bool:
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-select_streams", "a:0",
-                "-show_entries", "stream=codec_name",
-                "-of", "csv=p=0", str(path),
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        return result.returncode == 0 and bool(result.stdout.strip())
-    except Exception as e:
-        logger.warning("ffprobe audio check failed: %s", e)
-        return False
-
-
-def _run_ffmpeg_with_progress(cmd: list[str], input_path: Path, output_path: Path, progress_callback=None) -> bool:
-    logger.info("Running ffmpeg: %s", " ".join(cmd))
-    try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-        duration = get_video_duration(input_path) or 0.0
-        last_percent = -1.0
-        start_time = time.time()
-        if process.stdout is None:
-            raise RuntimeError("ffmpeg stdout is unavailable")
-        while True:
-            line = process.stdout.readline()
-            if not line and process.poll() is not None:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("out_time_ms="):
-                try:
-                    out_ms = int(line.split("=", 1)[1])
-                    if duration > 0:
-                        percent = min(99.0, (out_ms / 1_000_000) / duration * 100)
-                        if progress_callback and abs(percent - last_percent) >= 2.0:
-                            last_percent = percent
-                            eta = None
-                            if percent > 1:
-                                elapsed = time.time() - start_time
-                                eta = (elapsed / (percent / 100)) - elapsed
-                            progress_callback(percent, eta)
-                except ValueError:
-                    pass
-            elif line.startswith("progress=") and line.endswith("end"):
-                break
-        process.wait(timeout=3600)
-        if process.returncode != 0:
-            stderr = process.stderr.read() if process.stderr else ""
-            logger.error("ffmpeg failed (code %s): %s", process.returncode, stderr[-2000:])
-            return False
-        if progress_callback:
-            progress_callback(100.0, 0)
-        return output_path.exists() and output_path.stat().st_size > 0
-    except Exception as e:
-        logger.exception("ffmpeg error: %s", e)
-        return False
-
-
-def extract_audio_opus(input_path: Path, output_path: Path, progress_callback=None) -> bool:
-    cmd = [
-        "ffmpeg", "-y", "-i", str(input_path),
-        "-vn", "-map", "0:a:0",
-        "-c:a", "libopus", "-b:a", "48k", "-ac", "1", "-application", "voip",
-        "-progress", "pipe:1", "-nostats", str(output_path),
-    ]
-    return _run_ffmpeg_with_progress(cmd, input_path, output_path, progress_callback)
-
-
-def extract_audio_mp3(input_path: Path, output_path: Path, progress_callback=None) -> bool:
-    cmd = [
-        "ffmpeg", "-y", "-i", str(input_path),
-        "-vn", "-map", "0:a:0",
-        "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
-        "-progress", "pipe:1", "-nostats", str(output_path),
-    ]
-    return _run_ffmpeg_with_progress(cmd, input_path, output_path, progress_callback)
-
-
-class StatusEditor:
-    """One in-flight edit_text per status message. Latest text wins."""
-
-    def __init__(self, msg: Optional[Message] = None) -> None:
-        self.msg = msg
-        self._pending: Optional[str] = None
-        self._shown: Optional[str] = None
-        self._task: Optional[asyncio.Task] = None
-        self._closed = False
-        self._allow_progress = False
-
-    def attach(self, msg: Optional[Message]) -> None:
-        self.msg = msg
-
-    def set(self, text: str, *, progress: bool = False) -> None:
-        if self._closed or self.msg is None:
-            return
-        if progress and not self._allow_progress:
-            return
-        if text == self._shown or text == self._pending:
-            return
-        self._pending = text
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._flush())
-
-    def enable_progress(self) -> None:
-        self._allow_progress = True
-
-    def disable_progress(self) -> None:
-        self._allow_progress = False
-
-    async def set_now(self, text: str) -> None:
-        self.set(text)
-        await self.wait()
-
-    async def wait(self) -> None:
-        task = self._task
-        if task is not None and not task.done():
-            try:
-                await task
-            except Exception:
-                pass
-
-    def close(self) -> None:
-        self._closed = True
-        self._allow_progress = False
-        self._pending = None
-
-    async def _flush(self) -> None:
-        while self._pending is not None and not self._closed and self.msg is not None:
-            text = self._pending
-            self._pending = None
-            if text == self._shown:
-                continue
-            await _safe_edit(self.msg, text)
-            self._shown = text
-
-
-async def _safe_edit(msg: Optional[Message], text: str) -> None:
-    if msg is None:
-        return
-    try:
-        await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
-    except TelegramError:
-        pass
-
-
-def _human_size(num: int | float) -> str:
-    for unit in ("Б", "КБ", "МБ", "ГБ"):
-        if abs(num) < 1024:
-            return f"{num:.1f} {unit}"
-        num /= 1024
-    return f"{num:.1f} ТБ"
-
-
-def _extract_video_info(message: Message) -> Optional[Tuple[str, int, str, int]]:
-    if message.animation:
-        return None
-    if message.video:
-        v = message.video
-        return (v.file_id, v.duration or 0, getattr(v, "file_name", None) or "video.mp4", v.file_size or 0)
-    if (
-        message.document and message.document.mime_type
-        and message.document.mime_type.startswith("video/")
-        and not (message.document.file_name or "").lower().endswith(".gif")
-        and message.document.mime_type != "image/gif"
-    ):
-        d = message.document
-        return (d.file_id, 0, d.file_name or "video.mp4", d.file_size or 0)
-    return None
+def save_chat_settings() -> None:
+    save_chat_settings_file(config.chat_settings_file, chat_settings)
 
 
 async def process_video(
@@ -493,7 +102,9 @@ async def process_video(
     if not info:
         return
 
-    file_id, duration, file_name, file_size = info
+    file_id = info.file_id
+    duration = info.duration
+    file_name = info.file_name
     if duration and duration > settings.max_duration_seconds:
         logger.info("Skipping video in chat %s: duration %ss > limit %ss", chat_id, duration, settings.max_duration_seconds)
         return
@@ -634,7 +245,9 @@ async def process_extract_audio(
     if not info:
         return
 
-    file_id, duration, file_name, file_size = info
+    file_id = info.file_id
+    duration = info.duration
+    file_name = info.file_name
     if duration and duration > MAX_DURATION_SECONDS:
         await reply_to.reply_text(
             f"⏭ Слишком длинное видео ({duration} с), лимит {MAX_DURATION_SECONDS} с."
@@ -731,7 +344,7 @@ async def process_extract_audio(
             if not sent:
                 await status.set_now("🔄 Кодирую MP3…")
                 status.enable_progress()
-                mp3_ok = await asyncio.to_thread(extract_audio_mp3, input_path, mp3_path, progress_cb)
+                mp3_ok = await asyncio.to_thread(extract_audio_mp3_for_config, input_path, mp3_path, progress_cb)
                 status.disable_progress()
                 await status.wait()
                 if not mp3_ok:
@@ -866,7 +479,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         chat_settings.pop(chat_id, None)
         save_chat_settings()
         await message.reply_text(
-            "✅ Настройки для этого чата были сброшены.\n\n" + settings_text(CompressionSettings()),
+            "✅ Настройки для этого чата были сброшены.\n\n" + settings_text(default_settings),
             parse_mode=ParseMode.HTML,
             reply_markup=settings_keyboard(),
         )
@@ -915,7 +528,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         chat_settings.pop(chat_id, None)
         save_chat_settings()
         await query.edit_message_text(
-            "✅ Настройки для этого чата были сброшены.\n\n" + settings_text(CompressionSettings()),
+            "✅ Настройки для этого чата были сброшены.\n\n" + settings_text(default_settings),
             parse_mode=ParseMode.HTML,
             reply_markup=settings_keyboard(),
         )
@@ -924,9 +537,9 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         user_data.pop("pending_setting", None)
         await query.answer()
         try:
-            await callback_message.delete()
+            await query.edit_message_text("✅ Настройки были сохранены.", reply_markup=None)
         except TelegramError:
-            await query.edit_message_text("Настройки закрыты.", reply_markup=None)
+            await query.delete_message()
         return
     parts = data.split(":")
     if len(parts) == 2 and parts[0] == "settings":
@@ -946,7 +559,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer()
         user_data["pending_setting"] = name
         await callback_message.reply_text(
-            f"Введите {setting_label(name)} в ответ на это сообщение:",
+            f"Введите {setting_label(name)} в ответ на это сообщение.",
             reply_markup=ForceReply(selective=True),
         )
         return
@@ -1088,7 +701,7 @@ def main() -> None:
     application.add_handler(MessageHandler((filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, handle_video))
     logger.info(
         "Bot starting… max_duration=%ss, max_height=%s, crf=%s, concurrency=%s",
-        MAX_DURATION_SECONDS, MAX_HEIGHT, CRF, COMPRESS_CONCURRENCY,
+        MAX_DURATION_SECONDS, config.max_height, config.crf, COMPRESS_CONCURRENCY,
     )
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
