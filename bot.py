@@ -105,6 +105,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚀 Preset", callback_data="settings:preset"), InlineKeyboardButton("🔊 Аудио", callback_data="settings:audio")],
         [InlineKeyboardButton("⏱ Длительность", callback_data="settings:duration"), InlineKeyboardButton("🎞 FPS", callback_data="settings:fps")],
         [InlineKeyboardButton("♻️ Сбросить", callback_data="settings:reset")],
+        [InlineKeyboardButton("✖️ Закрыть", callback_data="settings:close")],
     ])
 
 
@@ -119,7 +120,10 @@ def setting_options_keyboard(name: str) -> InlineKeyboardMarkup:
     }
     buttons = [InlineKeyboardButton(label, callback_data=f"settings:set:{name}:{value}") for label, value in options[name]]
     rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings:back")])
+    rows.extend([
+        [InlineKeyboardButton("⬅️ Назад", callback_data="settings:back")],
+        [InlineKeyboardButton("✖️ Закрыть", callback_data="settings:close")],
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -915,6 +919,14 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             parse_mode=ParseMode.HTML,
             reply_markup=settings_keyboard(),
         )
+        return
+    if data == "settings:close":
+        user_data.pop("pending_setting", None)
+        await query.answer()
+        try:
+            await callback_message.delete()
+        except TelegramError:
+            await query.edit_message_text("Настройки закрыты.", reply_markup=None)
         return
     parts = data.split(":")
     if len(parts) == 2 and parts[0] == "settings":
