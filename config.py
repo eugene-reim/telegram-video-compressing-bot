@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
-
-logger = logging.getLogger("video-compressor-bot")
-
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -20,7 +16,6 @@ class AppConfig:
     preset: str
     default_fps: int
     compress_concurrency: int
-    data_dir: Path
     tmp_dir: Path
     monitored_file: Path
     chat_settings_file: Path
@@ -46,7 +41,6 @@ def load_config() -> AppConfig:
         preset=os.getenv("PRESET", "medium"),
         default_fps=int(os.getenv("DEFAULT_FPS", "30")),
         compress_concurrency=max(1, int(os.getenv("COMPRESS_CONCURRENCY", "1"))),
-        data_dir=data_dir,
         tmp_dir=tmp_dir,
         monitored_file=data_dir / "monitored_chats.json",
         chat_settings_file=data_dir / "chat_settings.json",

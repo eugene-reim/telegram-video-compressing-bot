@@ -23,9 +23,24 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 from config import load_config
-from media import VOICE_MAX_BYTES, compress_video, extract_audio_mp3, extract_audio_opus, extract_video_info, get_video_duration, has_audio_stream, human_size
+from media import (
+    VOICE_MAX_BYTES,
+    compress_video,
+    extract_audio_mp3,
+    extract_audio_opus,
+    extract_video_info,
+    get_video_duration,
+    has_audio_stream,
+    human_size,
+)
 from models import CompressionSettings
-from settings_ui import parse_setting, setting_label, setting_options_keyboard, settings_keyboard, settings_text
+from settings_ui import (
+    parse_setting,
+    setting_label,
+    setting_options_keyboard,
+    settings_keyboard,
+    settings_text,
+)
 from status import StatusEditor, safe_edit
 from storage import (
     load_chat_settings as load_chat_settings_file,
@@ -34,19 +49,22 @@ from storage import (
     save_monitored as save_monitored_file,
 )
 
-request = HTTPXRequest(connection_pool_size=8, connect_timeout=30.0, read_timeout=30.0, write_timeout=60.0, pool_timeout=30.0)
+request = HTTPXRequest(
+    connection_pool_size=8,
+    connect_timeout=30.0,
+    read_timeout=30.0,
+    write_timeout=60.0,
+    pool_timeout=30.0,
+)
 config = load_config()
-BOT_TOKEN = config.bot_token
-MAX_DURATION_SECONDS = config.max_duration_seconds
-DEFAULT_FPS = config.default_fps
-COMPRESS_CONCURRENCY = config.compress_concurrency
-TMP_DIR = config.tmp_dir
 
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
 logger = logging.getLogger("video-compressor-bot")
 monitored_chats: set[int] = set()
 chat_settings: dict[int, CompressionSettings] = {}
-compress_semaphore = asyncio.Semaphore(COMPRESS_CONCURRENCY)
+compress_semaphore = asyncio.Semaphore(config.compress_concurrency)
 default_settings = CompressionSettings(
     max_duration_seconds=config.max_duration_seconds,
     max_height=config.max_height,
@@ -54,13 +72,6 @@ default_settings = CompressionSettings(
     preset=config.preset,
     audio_bitrate=config.audio_bitrate,
 )
-_extract_video_info = extract_video_info
-_human_size = human_size
-_safe_edit = safe_edit
-
-
-def extract_audio_mp3_for_config(input_path: Path, output_path: Path, progress_callback=None) -> bool:
-    return extract_audio_mp3(input_path, output_path, config.audio_bitrate, progress_callback)
 
 
 def get_chat_settings(chat_id: int) -> CompressionSettings:
@@ -98,7 +109,7 @@ async def process_video(
 
     chat_id = target_message.chat.id
     settings = settings or get_chat_settings(chat_id)
-    info = _extract_video_info(target_message)
+    info = extract_video_info(target_message)
     if not info:
         return
 
@@ -106,7 +117,12 @@ async def process_video(
     duration = info.duration
     file_name = info.file_name
     if duration and duration > settings.max_duration_seconds:
-        logger.info("Skipping video in chat %s: duration %ss > limit %ss", chat_id, duration, settings.max_duration_seconds)
+        logger.info(
+            "Skipping video in chat %s: duration %ss > limit %ss",
+            chat_id,
+            duration,
+            settings.max_duration_seconds,
+        )
         return
 
     status = StatusEditor()
@@ -115,25 +131,23 @@ async def process_video(
     queued = compress_semaphore.locked()
     if queued:
         try:
-            status.attach(await reply_to.reply_text(
-                "⏳ Видео в очереди на сжатие…"
-            ))
+            status.attach(await reply_to.reply_text("⏳ Видео в очереди на сжатие…"))
         except TelegramError as e:
             logger.warning("Failed to send queue notice in chat %s: %s", chat_id, e)
 
     async with compress_semaphore:
         try:
-            start_text = (
-                "⏳ Обработка видео - начинаю сжатие…"
-            )
-            if status.msg is None:
+            start_text = "⏳ Обработка видео - начинаю сжатие…"
+            if status.message is None:
                 status.attach(await reply_to.reply_text(start_text))
             else:
                 await status.set_now(start_text)
 
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+            await context.bot.send_chat_action(
+                chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO
+            )
 
-            work_dir = Path(tempfile.mkdtemp(prefix="vcomp_", dir=str(TMP_DIR)))
+            work_dir = Path(tempfile.mkdtemp(prefix="vcomp_", dir=str(config.tmp_dir)))
             input_path = work_dir / "input"
             output_path = work_dir / "output.mp4"
 
@@ -149,8 +163,8 @@ async def process_video(
                 duration = get_video_duration(input_path) or 0
                 if duration > settings.max_duration_seconds:
                     await status.set_now(
-                        f"⏭ Пропущено — длительность {duration:.0f} с "
-                        f"превышает лимит {settings.max_duration_seconds} с."
+                        f"⏭ Пропущено — длительность {duration:.0f}с"
+                        f"превышает лимит {settings.max_duration_seconds}с."
                     )
                     return
 
@@ -164,21 +178,16 @@ async def process_video(
                 if now - last_edit < 3.5 and percent < 99:
                     return
                 last_edit = now
-                eta_str = f"~{int(eta)} с осталось" if eta and eta > 0 else "…"
-                text = (
-                    f"🔄 Сжимаю… *{percent:.0f}%* {eta_str}"
-                )
+                eta_str = f"~{int(eta)}с" if eta and eta > 0 else "..."
+                text = f"🔄 Сжимаю… *{percent:.0f}%* {eta_str}"
                 loop.call_soon_threadsafe(lambda t=text: status.set(t, progress=True))
 
-            fps_info = f" / {fps} fps" if fps > 0 else ""
-            await status.set_now(
-                f"🔄 Сжимаю…\nОригинал: {_human_size(original_size)}\n"
-                f"Настройки: {settings.max_height}p / CRF {settings.crf} / {settings.preset}"
-                f" / {settings.audio_bitrate}{fps_info}"
-            )
+            await status.set_now(f"🔄 Сжимаю...")
             status.enable_progress()
 
-            success = await asyncio.to_thread(compress_video, input_path, output_path, settings, progress_cb, fps)
+            success = await asyncio.to_thread(
+                compress_video, input_path, output_path, settings, progress_cb, fps
+            )
 
             status.disable_progress()
             await status.wait()
@@ -189,38 +198,45 @@ async def process_video(
 
             new_size = output_path.stat().st_size
             ratio = (1 - new_size / original_size) * 100 if original_size else 0
-            
-            if ratio <=0:
+
+            if ratio <= 0:
                 await status.set_now("ℹ️ Сжатие не уменьшило размер файла.")
                 status.close()
                 return
-            
+
             await status.set_now(
-                f"⬆️ Загружаю сжатое видео… {_human_size(original_size)} > "
-                f"{_human_size(new_size)} (на {ratio:.0f}% меньше)"
+                f"⬆️ Загружаю сжатое видео… {human_size(original_size)} > "
+                f"{human_size(new_size)} (на {ratio:.0f}% меньше)"
             )
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+            await context.bot.send_chat_action(
+                chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO
+            )
 
             caption = (
-                f"📦 Сжато {_human_size(original_size)} > {_human_size(new_size)} "
+                f"📦 Сжато {human_size(original_size)} > {human_size(new_size)} "
                 f"(на {ratio:.0f}% меньше)"
             )
             with output_path.open("rb") as f:
                 await reply_to.reply_video(
-                    video=f, caption=caption, supports_streaming=True,
+                    video=f,
+                    caption=caption,
+                    supports_streaming=True,
                     filename=Path(file_name).stem + "_compressed.mp4",
                 )
 
             status.close()
-            if status.msg is not None:
+            if status.message is not None:
                 try:
-                    await status.msg.delete()
+                    await status.message.delete()
                 except TelegramError:
-                    await _safe_edit(status.msg, "✅ Готово.")
+                    await safe_edit(status.message, "✅ Готово.")
 
             logger.info(
                 "Compressed video in chat %s: %s > %s (%.1f%%)",
-                chat_id, _human_size(original_size), _human_size(new_size), ratio,
+                chat_id,
+                human_size(original_size),
+                human_size(new_size),
+                ratio,
             )
         except Exception as e:
             logger.exception("Error handling video in chat %s: %s", chat_id, e)
@@ -241,16 +257,16 @@ async def process_extract_audio(
         reply_to = target_message
 
     chat_id = target_message.chat.id
-    info = _extract_video_info(target_message)
+    info = extract_video_info(target_message)
     if not info:
         return
 
     file_id = info.file_id
     duration = info.duration
     file_name = info.file_name
-    if duration and duration > MAX_DURATION_SECONDS:
+    if duration and duration > config.max_duration_seconds:
         await reply_to.reply_text(
-            f"⏭ Слишком длинное видео ({duration} с), лимит {MAX_DURATION_SECONDS} с."
+            f"⏭ Слишком длинное видео ({duration} с), лимит {config.max_duration_seconds} с."
         )
         return
 
@@ -260,25 +276,29 @@ async def process_extract_audio(
     queued = compress_semaphore.locked()
     if queued:
         try:
-            status.attach(await reply_to.reply_text("⏳ В очереди на извлечение аудио…"))
+            status.attach(
+                await reply_to.reply_text("⏳ В очереди на извлечение аудио…")
+            )
         except TelegramError as e:
             logger.warning("Failed to send queue notice in chat %s: %s", chat_id, e)
 
     async with compress_semaphore:
         try:
             start_text = "⏳ Извлекаю аудио…"
-            if status.msg is None:
+            if status.message is None:
                 status.attach(await reply_to.reply_text(start_text))
             else:
                 await status.set_now(start_text)
 
-            work_dir = Path(tempfile.mkdtemp(prefix="aext_", dir=str(TMP_DIR)))
+            work_dir = Path(tempfile.mkdtemp(prefix="aext_", dir=str(config.tmp_dir)))
             input_path = work_dir / "input"
             opus_path = work_dir / "audio.ogg"
             mp3_path = work_dir / "audio.mp3"
 
             await status.set_now("⬇️ Скачиваю видео…")
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+            await context.bot.send_chat_action(
+                chat_id=chat_id, action=ChatAction.UPLOAD_VOICE
+            )
             tg_file = await context.bot.get_file(file_id)
             await tg_file.download_to_drive(custom_path=str(input_path))
 
@@ -288,10 +308,10 @@ async def process_extract_audio(
 
             if not duration:
                 duration = get_video_duration(input_path) or 0
-                if duration > MAX_DURATION_SECONDS:
+                if duration > config.max_duration_seconds:
                     await status.set_now(
                         f"⏭ Пропущено — длительность {duration:.0f} с "
-                        f"превышает лимит {MAX_DURATION_SECONDS} с."
+                        f"превышает лимит {config.max_duration_seconds} с."
                     )
                     return
 
@@ -314,7 +334,9 @@ async def process_extract_audio(
 
             await status.set_now("🔄 Кодирую в голосовое (OGG/Opus)…")
             status.enable_progress()
-            success = await asyncio.to_thread(extract_audio_opus, input_path, opus_path, progress_cb)
+            success = await asyncio.to_thread(
+                extract_audio_opus, input_path, opus_path, progress_cb
+            )
             status.disable_progress()
             await status.wait()
 
@@ -327,8 +349,10 @@ async def process_extract_audio(
             stem = Path(file_name).stem
 
             if opus_size <= VOICE_MAX_BYTES:
-                await status.set_now(f"⬆️ Отправляю голосовое… {_human_size(opus_size)}")
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+                await status.set_now(f"⬆️ Отправляю голосовое… {human_size(opus_size)}")
+                await context.bot.send_chat_action(
+                    chat_id=chat_id, action=ChatAction.UPLOAD_VOICE
+                )
                 try:
                     with opus_path.open("rb") as f:
                         await reply_to.reply_voice(
@@ -339,19 +363,31 @@ async def process_extract_audio(
                     sent = True
                 except TelegramError as e:
                     logger.warning("reply_voice failed in chat %s: %s", chat_id, e)
-                    await status.set_now("ℹ️ Голосовое не отправилось, пробую аудиофайл…")
+                    await status.set_now(
+                        "ℹ️ Голосовое не отправилось, пробую аудиофайл…"
+                    )
 
             if not sent:
                 await status.set_now("🔄 Кодирую MP3…")
                 status.enable_progress()
-                mp3_ok = await asyncio.to_thread(extract_audio_mp3_for_config, input_path, mp3_path, progress_cb)
+                mp3_ok = await asyncio.to_thread(
+                    extract_audio_mp3,
+                    input_path,
+                    mp3_path,
+                    config.audio_bitrate,
+                    progress_cb,
+                )
                 status.disable_progress()
                 await status.wait()
                 if not mp3_ok:
                     await status.set_now("❌ Не удалось подготовить аудиофайл.")
                     return
-                await status.set_now(f"⬆️ Отправляю аудиофайл… {_human_size(mp3_path.stat().st_size)}")
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+                await status.set_now(
+                    f"⬆️ Отправляю аудиофайл… {human_size(mp3_path.stat().st_size)}"
+                )
+                await context.bot.send_chat_action(
+                    chat_id=chat_id, action=ChatAction.UPLOAD_VOICE
+                )
                 with mp3_path.open("rb") as f:
                     await reply_to.reply_audio(
                         audio=f,
@@ -361,11 +397,11 @@ async def process_extract_audio(
                     )
 
             status.close()
-            if status.msg is not None:
+            if status.message is not None:
                 try:
-                    await status.msg.delete()
+                    await status.message.delete()
                 except TelegramError:
-                    await _safe_edit(status.msg, "✅ Готово.")
+                    await safe_edit(status.message, "✅ Готово.")
 
             logger.info("Extracted audio in chat %s from %s", chat_id, file_name)
         except Exception as e:
@@ -458,7 +494,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"• Пресет: *{settings.preset}*\n"
         f"• Битрейт аудио: *{settings.audio_bitrate}*\n"
         f"• FPS: *{settings.fps or 'без ограничения'}*\n"
-        f"• Одновременных сжатий: *{COMPRESS_CONCURRENCY}*\n"
+        f"• Одновременных сжатий: *{config.compress_concurrency}*\n"
     )
     await message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -479,16 +515,21 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         chat_settings.pop(chat_id, None)
         save_chat_settings()
         await message.reply_text(
-            "✅ Настройки для этого чата были сброшены.\n\n" + settings_text(default_settings),
+            "✅ Настройки для этого чата были сброшены.\n\n"
+            + settings_text(default_settings),
             parse_mode=ParseMode.HTML,
             reply_markup=settings_keyboard(),
         )
         return
     if len(context.args) != 2:
-        await message.reply_text("Использование: /settings поле значение или /settings reset")
+        await message.reply_text(
+            "Использование: /settings поле значение или /settings reset"
+        )
         return
     try:
-        updated = parse_setting(context.args[0].lower(), context.args[1].lower(), get_chat_settings(chat_id))
+        updated = parse_setting(
+            context.args[0].lower(), context.args[1].lower(), get_chat_settings(chat_id)
+        )
     except (TypeError, ValueError) as e:
         await message.reply_text(
             f"❌ {e}\n\n{settings_text(get_chat_settings(chat_id))}",
@@ -528,7 +569,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         chat_settings.pop(chat_id, None)
         save_chat_settings()
         await query.edit_message_text(
-            "✅ Настройки для этого чата были сброшены.\n\n" + settings_text(default_settings),
+            "✅ Настройки для этого чата были сброшены.\n\n"
+            + settings_text(default_settings),
             parse_mode=ParseMode.HTML,
             reply_markup=settings_keyboard(),
         )
@@ -537,7 +579,9 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         user_data.pop("pending_setting", None)
         await query.answer()
         try:
-            await query.edit_message_text("✅ Настройки были сохранены.", reply_markup=None)
+            await query.edit_message_text(
+                "✅ Настройки были сохранены.", reply_markup=None
+            )
         except TelegramError:
             await query.delete_message()
         return
@@ -578,18 +622,25 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
-async def settings_value_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def settings_value_reply(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     message = update.message
     user_data = context.user_data
     name = user_data.pop("pending_setting", None) if user_data is not None else None
     if not message or not name or not message.reply_to_message:
         return
-    if not message.reply_to_message.from_user or not message.reply_to_message.from_user.is_bot:
+    if (
+        not message.reply_to_message.from_user
+        or not message.reply_to_message.from_user.is_bot
+    ):
         return
     if not message.text:
         return
     try:
-        updated = parse_setting(name, message.text.strip().lower(), get_chat_settings(message.chat.id))
+        updated = parse_setting(
+            name, message.text.strip().lower(), get_chat_settings(message.chat.id)
+        )
     except (TypeError, ValueError) as e:
         await message.reply_text(f"❌ {e}. Нажмите /settings и попробуйте снова.")
         return
@@ -608,12 +659,14 @@ async def compress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     replied = message.reply_to_message
     if not replied:
-        await message.reply_text("Ответьте командой /compress на сообщение, которое содержит видео.")
+        await message.reply_text(
+            "Ответьте командой /compress на сообщение, которое содержит видео."
+        )
         return
     if replied.from_user and replied.from_user.is_bot:
         await message.reply_text("Не могу сжимать сообщения ботов.")
         return
-    if not _extract_video_info(replied):
+    if not extract_video_info(replied):
         await message.reply_text("В сообщении, на которое вы ответили, нет видео.")
         return
     await process_video(replied, context, reply_to=message)
@@ -630,11 +683,11 @@ async def compress_fps_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Можно указать FPS: /compress_fps 24"
         )
         return
-    if not _extract_video_info(replied):
+    if not extract_video_info(replied):
         await message.reply_text("В сообщении, на которое вы ответили, нет видео.")
         return
     settings = get_chat_settings(message.chat.id)
-    fps = settings.fps or DEFAULT_FPS
+    fps = settings.fps or config.default_fps
     if context.args:
         try:
             fps = int(context.args[0])
@@ -656,7 +709,7 @@ async def extract_audio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "Ответьте командой /extract_audio на сообщение с видео."
         )
         return
-    if not _extract_video_info(replied):
+    if not extract_video_info(replied):
         await message.reply_text("В сообщении, на которое вы ответили, нет видео.")
         return
     await process_extract_audio(replied, context, reply_to=message)
@@ -670,7 +723,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if message.chat.id not in monitored_chats:
         return
-    if not _extract_video_info(message):
+    if not extract_video_info(message):
         return
     await process_video(message, context)
 
@@ -680,7 +733,7 @@ def main() -> None:
     load_chat_settings()
     application = (
         Application.builder()
-        .token(BOT_TOKEN)
+        .token(config.bot_token)
         .request(request)
         .get_updates_request(request)
         .concurrent_updates(True)
@@ -693,15 +746,28 @@ def main() -> None:
     application.add_handler(CommandHandler("remove", remove_chat))
     application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CommandHandler("settings", settings_cmd))
-    application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^settings:"))
+    application.add_handler(
+        CallbackQueryHandler(settings_callback, pattern=r"^settings:")
+    )
     application.add_handler(CommandHandler("compress", compress_cmd))
     application.add_handler(CommandHandler("compress_fps", compress_fps_cmd))
     application.add_handler(CommandHandler("extract_audio", extract_audio_cmd))
-    application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, settings_value_reply))
-    application.add_handler(MessageHandler((filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, handle_video))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.REPLY & ~filters.COMMAND, settings_value_reply
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            (filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, handle_video
+        )
+    )
     logger.info(
         "Bot starting… max_duration=%ss, max_height=%s, crf=%s, concurrency=%s",
-        MAX_DURATION_SECONDS, config.max_height, config.crf, COMPRESS_CONCURRENCY,
+        config.max_duration_seconds,
+        config.max_height,
+        config.crf,
+        config.compress_concurrency,
     )
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 

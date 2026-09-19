@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -20,8 +19,3 @@ class VideoInfo:
     duration: int
     file_name: str
     file_size: int
-
-@dataclass(frozen=True)
-class Progress:
-    percent: float
-    eta: Optional[float]

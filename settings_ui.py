@@ -8,7 +8,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from models import CompressionSettings
 
-SETTING_NAMES = {"height", "crf", "audio", "duration", "fps", "preset"}
 PRESETS = {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
 
 

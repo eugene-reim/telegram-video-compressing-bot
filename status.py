@@ -31,10 +31,6 @@ class StatusEditor:
     def attach(self, message: Optional[Message]) -> None:
         self.message = message
 
-    @property
-    def msg(self) -> Optional[Message]:
-        return self.message
-
     def set(self, text: str, *, progress: bool = False) -> None:
         if self._closed or self.message is None:
             return
