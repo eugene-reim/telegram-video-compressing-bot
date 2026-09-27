@@ -577,6 +577,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     if data == "settings:close":
         user_data.pop("pending_setting", None)
+        user_data.pop("settings_menu_message_id", None)
+        user_data.pop("settings_menu_chat_id", None)
         await query.answer()
         try:
             await query.edit_message_text(
@@ -602,6 +604,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if value == "custom":
         await query.answer()
         user_data["pending_setting"] = name
+        user_data["settings_menu_message_id"] = callback_message.message_id
+        user_data["settings_menu_chat_id"] = callback_message.chat.id
         await callback_message.reply_text(
             f"Введите {setting_label(name)} в ответ на это сообщение.",
             reply_markup=ForceReply(selective=True),
@@ -646,6 +650,28 @@ async def settings_value_reply(
         return
     chat_settings[message.chat.id] = updated
     save_chat_settings()
+    menu_id = (
+        user_data.pop("settings_menu_message_id", None)
+        if user_data is not None
+        else None
+    )
+
+    menu_chat_id = (
+        user_data.pop("settings_menu_chat_id", None) if user_data is not None else None
+    )
+    if menu_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=menu_chat_id or message.chat.id,
+                message_id=menu_id,
+            )
+        except TelegramError:
+            pass
+    if message.reply_to_message:
+        try:
+            await message.reply_to_message.delete()
+        except TelegramError:
+            pass
     await message.reply_text(
         "✅ Настройки для этого чата были сохранены.\n\n" + settings_text(updated),
         parse_mode=ParseMode.HTML,
